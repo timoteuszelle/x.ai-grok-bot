@@ -1,0 +1,198 @@
+name: Update Grok Bot
+
+on:
+  schedule:
+    - cron: "17 4,16 * * *"
+  workflow_dispatch:
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: update-grok-bot
+  cancel-in-progress: false
+
+jobs:
+  update-grok-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+
+      - name: Detect upstream version and update package pin
+        id: update
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          x64_json="$(curl -fsSL https://api2.cursor.sh/updates/api/download/stable/linux-x64/sand)"
+          arm_json="$(curl -fsSL https://api2.cursor.sh/updates/api/download/stable/linux-arm64/sand)"
+
+          manifest="$(X64_JSON="$x64_json" ARM_JSON="$arm_json" python3 - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          x = json.loads(os.environ["X64_JSON"])
+          a = json.loads(os.environ["ARM_JSON"])
+          version_re = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[.-][0-9A-Za-z._-]+)?")
+          commit_re = re.compile(r"[0-9a-f]{40}")
+
+          for label, doc in (("x64", x), ("arm64", a)):
+              version = str(doc.get("version") or "")
+              commit = str(doc.get("commitSha") or "")
+              url = str(doc.get("debUrl") or "")
+              if not version_re.fullmatch(version):
+                  sys.exit(f"Unexpected {label} version: {version}")
+              if not commit_re.fullmatch(commit):
+                  sys.exit(f"Unexpected {label} commit: {commit}")
+              if not url.startswith("https://downloads.cursor.com/") or not url.endswith(".deb"):
+                  sys.exit(f"Unexpected {label} debUrl: {url}")
+
+          if x["version"] != a["version"] or x["commitSha"] != a["commitSha"]:
+              sys.exit(
+                  f"x64 and arm64 manifests disagree: {x['version']} {x['commitSha']} vs {a['version']} {a['commitSha']}"
+              )
+
+          print(x["version"])
+          print(x["commitSha"])
+          print(x["debUrl"])
+          print(a["debUrl"])
+          PY
+          )"
+
+          latest_version="$(sed -n '1p' <<<"$manifest")"
+          latest_commit="$(sed -n '2p' <<<"$manifest")"
+          x64_url="$(sed -n '3p' <<<"$manifest")"
+          arm_url="$(sed -n '4p' <<<"$manifest")"
+
+          # shellcheck disable=SC2016
+          current_version="$(python3 -c 'import pathlib,re,sys; t=pathlib.Path("pkgs/grok-bot.nix").read_text(); m=re.search(r"version\s*=\s*\"([^\"]+)\"\s*;", t); print(m.group(1) if m else sys.exit("Could not parse current version in pkgs/grok-bot.nix"))')"
+          # shellcheck disable=SC2016
+          current_x64_url="$(python3 -c 'import pathlib,re,sys; t=pathlib.Path("pkgs/grok-bot.nix").read_text(); m=re.search(r"x86_64-linux\s*=\s*\{.*?url\s*=\s*\"([^\"]+)\"\s*;", t, re.S); print(m.group(1) if m else sys.exit("Could not parse current x86_64 url in pkgs/grok-bot.nix"))')"
+
+          {
+            echo "current_version=$current_version"
+            echo "latest_version=$latest_version"
+            echo "latest_commit=$latest_commit"
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ "$current_x64_url" == "$x64_url" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # shellcheck disable=SC2016
+          x86_hash="$(nix store prefetch-file --json "$x64_url" | python3 -c 'import json, sys; print(json.load(sys.stdin)["hash"])')"
+          # shellcheck disable=SC2016
+          arm_hash="$(nix store prefetch-file --json "$arm_url" | python3 -c 'import json, sys; print(json.load(sys.stdin)["hash"])')"
+
+          VERSION="$latest_version" COMMIT="$latest_commit" X64_URL="$x64_url" ARM_URL="$arm_url" X86_HASH="$x86_hash" ARM_HASH="$arm_hash" python3 - <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+
+          version = os.environ["VERSION"]
+          commit = os.environ["COMMIT"]
+          x64_url = os.environ["X64_URL"]
+          arm_url = os.environ["ARM_URL"]
+          x86_hash = os.environ["X86_HASH"]
+          arm_hash = os.environ["ARM_HASH"]
+
+          path = pathlib.Path("pkgs/grok-bot.nix")
+          text = path.read_text()
+
+          def replace_once(pattern, repl, label):
+              global text
+              text, count = re.subn(pattern, repl, text, count=1, flags=re.M)
+              if count != 1:
+                  sys.exit(f"Failed to update {label} in pkgs/grok-bot.nix")
+
+          replace_once(
+              r'(version\s*=\s*")[^"]+(";)',
+              lambda m: f"{m.group(1)}{version}{m.group(2)}",
+              "version",
+          )
+          replace_once(
+              r'(commit\s*=\s*")[^"]+(";)',
+              lambda m: f"{m.group(1)}{commit}{m.group(2)}",
+              "commit",
+          )
+
+          def replace_artifact(system, url, hash_):
+              global text
+              pattern = rf'({re.escape(system)}\s*=\s*\{{.*?url\s*=\s*")[^"]+(";\s*hash\s*=\s*")[^"]+(";)'
+              match = re.search(pattern, text, flags=re.S)
+              if not match:
+                  sys.exit(f"Failed to update {system} artifact in pkgs/grok-bot.nix")
+              text = (
+                  text[: match.start()]
+                  + f"{match.group(1)}{url}{match.group(2)}{hash_}{match.group(3)}"
+                  + text[match.end() :]
+              )
+
+          replace_artifact("x86_64-linux", x64_url, x86_hash)
+          replace_artifact("aarch64-linux", arm_url, arm_hash)
+          path.write_text(text)
+          PY
+
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Validate flake and package build
+        if: steps.update.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          nix flake show
+          nix build .#grok-bot
+
+      - name: Ensure automerge label exists
+        if: steps.update.outputs.changed == 'true'
+        continue-on-error: true
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const name = "automerge";
+
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name });
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+              await github.rest.issues.createLabel({
+                owner,
+                repo,
+                name,
+                color: "0e8a16",
+                description: "PRs eligible for automatic merge"
+              });
+            }
+
+      - name: Create pull request
+        if: steps.update.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          branch: chore/grok-bot-${{ steps.update.outputs.latest_version }}
+          delete-branch: true
+          title: "chore: bump grok-bot to ${{ steps.update.outputs.latest_version }}"
+          commit-message: "chore: bump grok-bot to ${{ steps.update.outputs.latest_version }}"
+          labels: automerge
+          body: |
+            Automated update of the Grok Bot package pin.
+
+            - Current version: `${{ steps.update.outputs.current_version }}`
+            - Latest upstream: `${{ steps.update.outputs.latest_version }}`
+            - Commit: `${{ steps.update.outputs.latest_commit }}`
+            - Updated `pkgs/grok-bot.nix` (version, commit, URLs, and architecture hashes)
