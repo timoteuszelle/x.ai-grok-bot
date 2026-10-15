@@ -1,6 +1,14 @@
 name: Auto-merge Grok Bot bump PRs
 
 on:
+  # Opening a pull request with GITHUB_TOKEN does not start workflows.
+  # This follows the scheduled update after that run completes.
+  workflow_run:
+    workflows:
+      - Update Grok Bot
+    types:
+      - completed
+  workflow_dispatch:
   pull_request_target:
     types:
       - opened
@@ -17,18 +25,20 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
 concurrency:
-  group: automerge-grok-bot-bumps-${{ github.event.pull_request.number || github.event.check_suite.id || github.event.check_suite.pull_requests[0].number }}
-  cancel-in-progress: true
+  group: automerge-grok-bot-bumps-${{ github.event.pull_request.number || github.event.workflow_run.id || github.event.check_suite.id || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   automerge:
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Enable auto-merge for eligible bump PRs
+      - name: Merge eligible bump PRs and dispatch the release
         uses: actions/github-script@v8
         with:
           script: |
@@ -38,9 +48,20 @@ jobs:
             const ALLOWED_AUTHORS = new Set(["github-actions[bot]"]);
 
             async function getCandidatePRs() {
+              if (context.eventName === "workflow_run" || context.eventName === "workflow_dispatch") {
+                const { data } = await github.rest.pulls.list({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  state: "open",
+                  per_page: 50
+                });
+                return data;
+              }
+
               if (context.payload.pull_request) {
                 return [context.payload.pull_request];
               }
+
               const refs = context.payload.check_suite?.pull_requests ?? [];
               if (refs.length === 0) return [];
               const pulls = await Promise.all(
@@ -52,7 +73,63 @@ jobs:
                   })
                 )
               );
-              return pulls.map((p) => p.data);
+              return pulls.map((pull) => pull.data);
+            }
+
+            async function mergeCommitSha(pullNumber) {
+              const { data } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: pullNumber
+              });
+              return data.merged ? data.merge_commit_sha : null;
+            }
+
+            async function mergeWhenReady(pullNumber) {
+              const existing = await mergeCommitSha(pullNumber);
+              if (existing) {
+                core.info(`PR #${pullNumber} is already merged (${existing}).`);
+                return existing;
+              }
+
+              for (let attempt = 1; attempt <= 6; attempt++) {
+                try {
+                  const { data } = await github.rest.pulls.merge({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    pull_number: pullNumber,
+                    merge_method: "merge"
+                  });
+                  if (!data.merged || !data.sha) {
+                    throw new Error(data.message || "GitHub did not merge the pull request");
+                  }
+                  core.info(`Merged PR #${pullNumber} as ${data.sha}.`);
+                  return data.sha;
+                } catch (error) {
+                  const message = error instanceof Error ? error.message : String(error);
+                  if (error.status === 405 && /already merged/i.test(message)) {
+                    const sha = await mergeCommitSha(pullNumber);
+                    if (sha) return sha;
+                  }
+                  const retryable = error.status === 405 || error.status === 409;
+                  if (!retryable || attempt === 6) throw error;
+                  core.info(`PR #${pullNumber} is not mergeable yet (${attempt}/6): ${message}`);
+                  await new Promise((resolve) => setTimeout(resolve, 5000));
+                }
+              }
+
+              throw new Error(`PR #${pullNumber} was not merged.`);
+            }
+
+            async function dispatchRelease(sha) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: "release-from-pin.yml",
+                ref: "main",
+                inputs: { sha }
+              });
+              core.info(`Dispatched release workflow for ${sha}.`);
             }
 
             const candidates = await getCandidatePRs();
@@ -61,6 +138,7 @@ jobs:
               return;
             }
 
+            let failed = false;
             for (const candidate of candidates) {
               try {
                 const { data: pr } = await github.rest.pulls.get({
@@ -94,52 +172,30 @@ jobs:
                   continue;
                 }
 
-                if (pr.state !== "open" || pr.draft) {
-                  core.info(`Skipping PR #${pr.number}: PR is not open and ready for merge.`);
+                if (pr.draft) {
+                  core.info(`Skipping PR #${pr.number}: PR is a draft.`);
                   continue;
                 }
 
-                const labelNames = (pr.labels ?? []).map((l) => l.name);
+                if (pr.state !== "open" && !pr.merged) {
+                  core.info(`Skipping PR #${pr.number}: PR is not open.`);
+                  continue;
+                }
+
+                const labelNames = (pr.labels ?? []).map((label) => label.name);
                 if (!labelNames.includes(REQUIRED_LABEL)) {
                   core.info(`Skipping PR #${pr.number}: missing required label '${REQUIRED_LABEL}'.`);
                   continue;
                 }
 
-                if (pr.auto_merge) {
-                  core.info(`Auto-merge already enabled for PR #${pr.number}.`);
-                  continue;
-                }
-
-                if (pr.mergeable === false || pr.mergeable_state !== "clean") {
-                  core.info(
-                    `Skipping PR #${pr.number}: mergeable=${pr.mergeable}, mergeable_state=${pr.mergeable_state}.`
-                  );
-                  continue;
-                }
-
-                await github.graphql(
-                  `
-                    mutation EnableAutoMerge($pullRequestId: ID!) {
-                      enablePullRequestAutoMerge(
-                        input: {
-                          pullRequestId: $pullRequestId
-                          mergeMethod: MERGE
-                        }
-                      ) {
-                        pullRequest {
-                          number
-                          autoMergeRequest {
-                            enabledAt
-                          }
-                        }
-                      }
-                    }
-                  `,
-                  { pullRequestId: pr.node_id }
-                );
-
-                core.info(`Enabled auto-merge for PR #${pr.number}.`);
+                const sha = await mergeWhenReady(pr.number);
+                await dispatchRelease(sha);
               } catch (err) {
+                failed = true;
                 core.error(`Failed to process PR #${candidate.number}: ${err}`);
               }
+            }
+
+            if (failed) {
+              core.setFailed("One or more bump pull requests were not merged.");
             }

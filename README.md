@@ -94,14 +94,20 @@ GitHub Actions does this on a schedule. See below.
 
 - `.github/workflows/release-from-pin.yml`
   - Triggers: push to `main` when `pkgs/grok-bot.nix` changes, and manual dispatch
+  - Also dispatched after a bot merge. A merge made with `GITHUB_TOKEN` does not start `push` workflows
   - Tags `v<version>` and creates a GitHub Release for that pin
 
 - `.github/workflows/automerge-grok-bot-bumps.yml`
-  - Enables GitHub auto-merge only for bot-authored bump PRs (title and branch match, `automerge` label, open, non-draft, same repository, mergeable)
+  - Runs after a successful Update Grok Bot workflow, and on manual dispatch
+  - Merges bot-authored bump PRs (title and branch match, `automerge` label, open, non-draft, same repository)
+  - Dispatches the release workflow for the merge commit
+
+The repository setting "Allow GitHub Actions to create and approve pull requests" must stay enabled. Without it, the update workflow can push the bump branch and still fail while opening the pull request.
 
 Manual dispatch:
 
 - `gh workflow run update-grok-bot.yml --repo timoteuszelle/x.ai-grok-bot`
+- `gh workflow run automerge-grok-bot-bumps.yml --repo timoteuszelle/x.ai-grok-bot`
 - `gh workflow run release-from-pin.yml --repo timoteuszelle/x.ai-grok-bot`
 
 Pushing workflow-file changes over HTTPS needs a token with the `workflow` scope.

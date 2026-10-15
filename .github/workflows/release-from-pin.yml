@@ -8,6 +8,11 @@ on:
       - pkgs/grok-bot.nix
       - .github/workflows/release-from-pin.yml
   workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit to tag. Defaults to the workflow SHA.
+        required: false
+        type: string
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -24,6 +29,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.sha || github.sha }}
 
       - name: Read pinned Grok Bot version
         id: version
@@ -42,6 +49,7 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
           TAG: ${{ steps.version.outputs.tag }}
+          TARGET_SHA: ${{ github.event.inputs.sha || github.sha }}
         with:
           script: |
             const owner = context.repo.owner;
@@ -60,7 +68,7 @@ jobs:
                 owner,
                 repo,
                 tag_name: tag,
-                target_commitish: context.sha,
+                target_commitish: process.env.TARGET_SHA,
                 name: tag,
                 body: `Automated release for Grok Bot ${version}.`,
                 draft: false,
