@@ -53,16 +53,16 @@ let
   # Pinned from the stable download manifest:
   # https://api2.cursor.sh/updates/api/download/stable/linux-x64/sand
   # https://api2.cursor.sh/updates/api/download/stable/linux-arm64/sand
-  version = "0.78.5";
-  commit = "87b31da762ca894e084ea1a069477801c85166a3";
+  version = "0.79.2";
+  commit = "676f0815a4013954f4c8e3f4ac413acfbac0376c";
   artifacts = {
     x86_64-linux = {
-      url = "https://downloads.cursor.com/grokbot/stable/87b31da762ca894e084ea1a069477801c85166a3/linux/x64/grok-bot_0.78.5_amd64.deb";
-      hash = "sha256-MDx/qsnHvR9StSsmnTTut4Y5U0D+d7RaRee4hfYW4sw=";
+      url = "https://downloads.cursor.com/grokbot/stable/676f0815a4013954f4c8e3f4ac413acfbac0376c/linux/x64/grok-bot_0.79.2_amd64.deb";
+      hash = "sha256-ADmzgyrYdDqVu2wqTwUOH/vUkfxy279x/bggh5lQIhc=";
     };
     aarch64-linux = {
-      url = "https://downloads.cursor.com/grokbot/stable/87b31da762ca894e084ea1a069477801c85166a3/linux/arm64/grok-bot_0.78.5_arm64.deb";
-      hash = "sha256-efpGd952BZsKerQ2EsJKJqD87VrTDA5OEhPK1+rP3iw=";
+      url = "https://downloads.cursor.com/grokbot/stable/676f0815a4013954f4c8e3f4ac413acfbac0376c/linux/arm64/grok-bot_0.79.2_arm64.deb";
+      hash = "sha256-lvlU9imas5qAzP8Unso/KkvmMmhK4t/1Axvb2JyMN+o=";
     };
   };
   artifact =
